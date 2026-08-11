@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OK CUE here I go!</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-white p-4 font-sans min-h-screen flex flex-col justify-between">
+    <div class="w-full max-w-md mx-auto bg-slate-900 rounded-xl p-5 border border-slate-800">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-bold text-blue-500">xRocket Terminal</h2>
+            <span id="userHandle" class="text-xs bg-slate-800 px-2 py-1 rounded text-slate-300">@user</span>
+        </div>
+
+        <!-- Risk Parameters Display -->
+        <div class="bg-slate-800/50 p-4 rounded-lg mb-4 border border-slate-700 space-y-2">
+            <div class="flex justify-between text-sm">
+                <span class="text-slate-400">Max Trade Cap:</span>
+                <span class="font-mono text-blue-400">$25.00 (25% Balance)</span>
+            </div>
+            <div class="flex justify-between text-sm">
+                <span class="text-slate-400">Stop Loss:</span>
+                <span class="font-mono text-red-400">6.5% (Strict)</span>
+            </div>
+            <div class="flex justify-between text-sm">
+                <span class="text-slate-400">Platform Fee:</span>
+                <span class="font-mono text-yellow-400">3% (Non-Admin Users)</span>
+            </div>
+        </div>
+
+        <!-- Editable User Wallet Input -->
+        <div class="bg-slate-800/50 p-4 rounded-lg mb-4 border border-slate-700">
+            <label class="block text-xs font-semibold text-slate-400 uppercase mb-2">Payout Wallet Address (TON/GRAM)</label>
+            <input type="text" id="targetWallet" class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-xs font-mono text-white focus:border-blue-500 focus:outline-none" placeholder="Enter TON or GRAM address...">
+        </div>
+
+        <!-- Access Key Input -->
+        <div class="bg-slate-800/50 p-4 rounded-lg mb-6 border border-slate-700">
+            <label class="block text-xs font-semibold text-slate-400 uppercase mb-2">Terminal Access Key</label>
+            <input type="password" id="accessKey" class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-xs font-mono text-white focus:border-blue-500 focus:outline-none" placeholder="Enter Access Key to unlock...">
+        </div>
+
+        <button onclick="saveAndStart()" class="w-full bg-blue-600 active:bg-blue-700 text-white font-bold py-3 rounded-lg shadow-lg">
+            Unlock & Activate Engine
+        </button>
+    </div>
+
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.expand();
+        tg.ready();
+
+        if (tg.initDataUnsafe?.user) {
+            document.getElementById('userHandle').innerText = `@${tg.initDataUnsafe.user.username || tg.initDataUnsafe.user.first_name}`;
+        }
+
+        function saveAndStart() {
+            const walletInput = document.getElementById('targetWallet').value.trim();
+            const accessKeyInput = document.getElementById('accessKey').value.trim();
+
+            if (!walletInput) {
+                alert("Please enter a valid wallet address.");
+                return;
+            }
+            if (!accessKeyInput) {
+                alert("An Access Key is required to use this terminal.");
+                return;
+            }
+
+            tg.sendData(JSON.stringify({
+                action: "SAVE_SETTINGS",
+                userWallet: walletInput,
+                accessKey: accessKeyInput,
+                timestamp: Date.now()
+            }));
+            tg.close();
+        }
+    </script>
+</body>
+</html>
+
