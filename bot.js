@@ -1,218 +1,240 @@
-const TelegramBot = require('node-telegram-bot-api');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+// Local-only signing/token server. Run with: npm install && npm start
+// Holds your xRocket Bearer token and (optionally) your Changelly private key.
+// Never move these into the browser dashboard.
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const fetch = require("node-fetch");
 
-const CONFIG = {
-  telegramToken: process.env.TELEGRAM_BOT_TOKEN,
-  adminChatId: process.env.TELEGRAM_CHAT_ID, // Admin Telegram ID
-  adminGramAddress: 'UQBKSdooh-MvNvxhmpxi5cYrYqkLKfqsElZCI0tjLXn2iyfD', // 3% fee destination wallet
-  adminFeePercent: 0.03, // 3% platform fee for standard users
-  xrocketApiKey: process.env.XROCKET_API_KEY,
-  withdrawCurrency: 'USDT',
-  requiredAccessKey: process.env.ACCESS_KEY || '',
-  targetPairs: ['BTC_USDT', 'XAUT_USDT', 'ETH_USDT', 'SOL_USDT'],
-  stopLossPercent: 0.065, // Fixed 6.5% Stop Loss
-  maxTradeUsdtCap: 25.00,
-  balanceTradeRatio: 0.25
-};
+const app = express();
+app.use(express.json());
+app.use(
+  cors({
+    origin: process.env.ALLOWED_ORIGIN === "*" ? true : process.env.ALLOWED_ORIGIN,
+  })
+);
 
-// Initialize persistent SQLite database
-const db = new sqlite3.Database(path.join(__dirname, 'wallets.db'));
+const XROCKET_BASE = process.env.XROCKET_TESTNET === "true"
+  ? "https://exchange.api.testnet.xrocket.exchange"
+  : "https://exchange.api.xrocket.exchange";
+const CHANGELLY_BASE = "https://api.changelly.com/v2";
 
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS user_wallets (
-      chat_id TEXT PRIMARY KEY,
-      wallet_address TEXT,
-      is_authenticated INTEGER DEFAULT 0,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+/* ---------------------------------------------------------------------------
+ * xRocket Exchange API
+ * Auth: `Authorization: Bearer <token>` (from @xRocket bot > Settings >
+ * Exchange settings > API token). No request signing needed.
+ *
+ * IMPORTANT CAVEAT: xRocket's docs render exact request-body schemas in a
+ * client-side Swagger widget I can't execute from here. The field names below
+ * (symbol, side, type, size, funds, timeInForce) are inferred from their
+ * visible order-history example, which closely mirrors KuCoin's API shape.
+ * Before trusting this with real money: open
+ * https://docs.xrocket.exchange/api/exchange/reference/http/exchange-order-controller-place-order
+ * and use its "Try it" panel to confirm the exact body once, with the
+ * smallest possible test order.
+ * ------------------------------------------------------------------------- */
+async function xrocketCall(method, path, { query, body } = {}) {
+  const token = process.env.XROCKET_API_TOKEN;
+  if (!token) throw new Error("XROCKET_API_TOKEN not configured in .env");
+
+  const qs = query ? "?" + new URLSearchParams(query).toString() : "";
+  const res = await fetch(`${XROCKET_BASE}${path}${qs}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      accept: "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`xRocket ${method} ${path} -> ${res.status}: ${JSON.stringify(json)}`);
+  }
+  return json;
+}
+
+// ---------------------------------------------------------------------------
+// Changelly Exchange API v2 signing (RSA-SHA256 over the raw JSON body)
+// Kept as an optional fallback sweep path — see /api/sweep-execute below.
+// ---------------------------------------------------------------------------
+function changellyKeys() {
+  const hex = process.env.CHANGELLY_PRIVATE_KEY_HEX;
+  if (!hex) throw new Error("CHANGELLY_PRIVATE_KEY_HEX not configured in .env");
+  const privateKey = crypto.createPrivateKey({ key: Buffer.from(hex, "hex"), format: "der", type: "pkcs8" });
+  const publicKeyDer = crypto.createPublicKey(privateKey).export({ type: "pkcs1", format: "der" });
+  const apiKey = crypto.createHash("sha256").update(publicKeyDer).digest("base64");
+  return { privateKey, apiKey };
+}
+
+async function changellyCall(method, params = {}) {
+  const { privateKey, apiKey } = changellyKeys();
+  const message = { jsonrpc: "2.0", id: String(Date.now()), method, params };
+  const bodyStr = JSON.stringify(message);
+  const signature = crypto.sign("sha256", Buffer.from(bodyStr), privateKey).toString("base64");
+
+  const res = await fetch(CHANGELLY_BASE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Api-Key": apiKey, "X-Api-Signature": signature },
+    body: bodyStr,
+  });
+  const json = await res.json();
+  if (json.error) throw new Error(`Changelly ${method} error: ${JSON.stringify(json.error)}`);
+  return json.result;
+}
+
+const path = require("path");
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith("/api/")) return next(); // static assets: no secret needed to load the page shell
+  const required = process.env.BACKEND_SHARED_SECRET;
+  if (!required) return res.status(500).json({ ok: false, error: "BACKEND_SHARED_SECRET not configured in .env — refusing to run open." });
+  if (req.header("x-backend-secret") !== required) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
 });
 
-const dbSaveWallet = (chatId, wallet, isAuthenticated) => {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `INSERT OR REPLACE INTO user_wallets (chat_id, wallet_address, is_authenticated, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`,
-      [chatId.toString(), wallet, isAuthenticated ? 1 : 0],
-      function (err) {
-        if (err) reject(err);
-        else resolve(this);
-      }
-    );
-  });
-};
+app.use(express.static(path.join(__dirname, "public")));
 
-const dbGetUserData = (chatId) => {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT wallet_address, is_authenticated FROM user_wallets WHERE chat_id = ?`, [chatId.toString()], (err, row) => {
-      if (err) reject(err);
-      else resolve(row || null);
-    });
-  });
-};
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+app.get("/api/ping", (req, res) => res.json({ ok: true, time: Date.now() }));
 
-const bot = new TelegramBot(CONFIG.telegramToken, { polling: true });
-const isAdmin = (chatId) => chatId.toString() === CONFIG.adminChatId.toString();
-
-// Command: /start
-bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userData = await dbGetUserData(chatId);
-  const userRole = isAdmin(chatId) ? '👑 Administrator (Unlocked)' : '👤 Trader';
-  const statusNotice = (isAdmin(chatId) || userData?.is_authenticated) ? '🟢 Access Granted' : '🔒 Access Locked (Key Required)';
-
-  bot.sendMessage(chatId, `<b>xRocket Terminal</b>\nRole: <b>${userRole}</b>\nStatus: <b>${statusNotice}</b>\n\nClick below to configure settings & unlock:`, {
-    parse_mode: 'HTML',
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🚀 Open Terminal Settings", web_app: { url: process.env.WEB_APP_URL } }]
-      ]
-    }
-  });
-});
-
-// Process incoming WebApp settings & validate Access Key
-bot.on('web_app_data', async (msg) => {
-  const chatId = msg.chat.id;
+// Server-side CoinGecko proxy — avoids any browser CORS/CSP issues and keeps
+// your optional demo key out of client-visible requests.
+app.get("/api/market", async (req, res) => {
   try {
-    const data = JSON.parse(msg.web_app_data.data);
-
-    // Verify Access Key (Admin bypasses requirement)
-    const isKeyValid = data.accessKey === CONFIG.requiredAccessKey;
-    const hasAccess = isAdmin(chatId) || isKeyValid;
-
-    if (!hasAccess) {
-      await bot.sendMessage(
-        chatId,
-        `<b>❌ ACCESS DENIED</b>\nInvalid Terminal Access Key. Access to xRocket API engine was blocked.`,
-        { parse_mode: 'HTML' }
-      );
-      return;
+    const perPage = Math.min(Math.max(Number(req.query.perPage) || 100, 20), 250);
+    const key = process.env.COINGECKO_DEMO_KEY ? `&x_cg_demo_api_key=${encodeURIComponent(process.env.COINGECKO_DEMO_KEY)}` : "";
+    const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&price_change_percentage=1h,24h${key}`;
+    const cgRes = await fetch(url);
+    if (!cgRes.ok) {
+      const bodyText = await cgRes.text().catch(() => "");
+      throw new Error(`CoinGecko HTTP ${cgRes.status}${bodyText ? ` — ${bodyText.slice(0, 200)}` : ""}`);
     }
-
-    if (data.action === "SAVE_SETTINGS" && data.userWallet) {
-      await dbSaveWallet(chatId, data.userWallet, true);
-      const roleNotice = isAdmin(chatId) ? "Administrator Mode (0% Fee)" : "Trader Mode (3% Creator Fee Applied)";
-
-      await bot.sendMessage(
-        chatId,
-        `<b>🔓 ACCESS GRANTED</b>\nWallet: <code>${data.userWallet}</code>\nMode: <b>${roleNotice}</b>`,
-        { parse_mode: 'HTML' }
-      );
-    }
-  } catch (err) {
-    console.error("Error processing WebApp payload:", err.message);
+    const data = await cgRes.json();
+    res.json({ ok: true, result: data });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Place order execution via xRocket API
-async function placeXrocketOrder(orderParams) {
+// Trading-balance snapshot (funds available for opening new positions).
+app.get("/api/balance", async (req, res) => {
   try {
-    const response = await fetch("https://pay.xrocket.tg/api/v1/trade/order", {
-      method: 'POST',
-      headers: {
-        'Rocket-Pay-Key': CONFIG.xrocketApiKey,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(orderParams)
-    });
-    return await response.json();
-  } catch (err) {
-    console.error("xRocket Order Placement Error:", err.message);
-    return null;
+    const result = await xrocketCall("GET", "/api/v1/accounts/trading/balances");
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
-}
+});
 
-// Evaluate Trade Execution (Enforces risk management and auth check)
-async function evaluateAndTrade(chatId, pair, priceData) {
-  const userData = await dbGetUserData(chatId);
-
-  // Security Gate: Ensure user is authenticated before calling xRocket API
-  if (!isAdmin(chatId) && !userData?.is_authenticated) {
-    console.log(`Blocked trade attempt for unauthorized Chat ID: ${chatId}`);
-    return;
-  }
-
-  const isTargetPair = CONFIG.targetPairs.includes(pair);
-  const isSafeFallback = !isTargetPair && priceData.volatility < 0.02 && priceData.momentum > 0.01;
-
-  if (isTargetPair || isSafeFallback) {
-    const tradeAmount = Math.min(priceData.availableBalance * CONFIG.balanceTradeRatio, CONFIG.maxTradeUsdtCap);
-    const entryPrice = priceData.currentPrice;
-    const stopLossPrice = entryPrice * (1 - CONFIG.stopLossPercent);
-
-    // Place buy order on xRocket
-    const order = await placeXrocketOrder({
-      pair: pair,
-      side: 'BUY',
-      amount: tradeAmount,
-      stopLoss: stopLossPrice
-    });
-
-    await bot.sendMessage(chatId,
-      `<b>🚨 TRADE EXECUTED</b>\n` +
-      `<b>Pair:</b> ${pair}\n` +
-      `<b>Size:</b> $${tradeAmount.toFixed(2)}\n` +
-      `<b>Entry Price:</b> $${entryPrice}\n` +
-      `<b>Stop Loss (6.5%):</b> $${stopLossPrice.toFixed(4)}`,
-      { parse_mode: 'HTML' }
-    );
-
-    return order;
-  }
-}
-
-// Automated Profit Payout Engine (Admin gets 100%, Non-Admin splits 3% fee to Admin)
-async function processProfitWithdrawal(chatId, profitAmount) {
-  if (profitAmount <= 0) return;
-
-  const userData = await dbGetUserData(chatId);
-  const userWallet = userData?.wallet_address;
-
-  if (!userWallet) {
-    console.error(`No saved wallet found for Chat ID ${chatId}`);
-    return;
-  }
-
-  if (isAdmin(chatId)) {
-    // Admin receives 100% of profit with 0% fee
-    await executeXrocketTransfer(userWallet, profitAmount);
-    await bot.sendMessage(chatId, `<b>💰 ADMIN WITHDRAWAL (100%)</b>\nSent $${profitAmount.toFixed(2)} to <code>${userWallet}</code>`, { parse_mode: 'HTML' });
-  } else {
-    // Non-Admin: Route 3% fee to Admin GRAM address and 97% to user
-    const adminFee = profitAmount * CONFIG.adminFeePercent;
-    const userPayout = profitAmount * (1 - CONFIG.adminFeePercent);
-
-    // 1. Send 97% profit to user wallet
-    await executeXrocketTransfer(userWallet, userPayout);
-    await bot.sendMessage(chatId, `<b>💰 PROFIT WITHDRAWN (97%)</b>\nSent $${userPayout.toFixed(2)} to <code>${userWallet}</code>\n<i>(3% creator fee applied: $${adminFee.toFixed(2)})</i>`, { parse_mode: 'HTML' });
-
-    // 2. Route 3% fee to Admin GRAM wallet
-    await executeXrocketTransfer(CONFIG.adminGramAddress, adminFee);
-    await bot.sendMessage(CONFIG.adminChatId, `<b>👑 ADMIN FEE COLLECTED (3%)</b>\nReceived $${adminFee.toFixed(2)} from user <code>${chatId}</code>`, { parse_mode: 'HTML' });
-  }
-}
-
-// xRocket Pay API Transfer Call
-async function executeXrocketTransfer(targetAddress, amount) {
+// body: { symbol: "BTC" (base asset only, we append -USDT), side: "BUY"|"SELL", sizeUsd?, qty? }
+// BUY sizes by USD funds (matches our $25 / 25% risk cap directly).
+// SELL sizes by base-asset quantity (closing a specific held position).
+app.post("/api/order", async (req, res) => {
   try {
-    return await fetch("https://pay.xrocket.tg/api/v1/withdraw", {
-      method: 'POST',
-      headers: {
-        'Rocket-Pay-Key': CONFIG.xrocketApiKey,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        network: 'TON',
-        currency: CONFIG.withdrawCurrency,
-        amount: amount,
-        address: targetAddress
-      })
-    });
-  } catch (err) {
-    console.error("xRocket Transfer Error:", err.message);
+    const { symbol, side, sizeUsd, qty } = req.body;
+    if (!symbol || !side) throw new Error("symbol and side are required");
+    const pair = `${symbol.toUpperCase()}-USDT`;
+    const body = { symbol: pair, side: side.toLowerCase(), type: "market", timeInForce: "IOC" };
+    if (side.toUpperCase() === "BUY") {
+      if (!sizeUsd) throw new Error("sizeUsd required for BUY");
+      body.funds = String(sizeUsd);
+    } else {
+      if (!qty) throw new Error("qty required for SELL");
+      body.size = String(qty);
+    }
+    const result = await xrocketCall("POST", "/api/v1/orders", { body });
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
-}
+});
 
-console.log("xRocket Bot Engine running on Long Polling...");
+// Move funds from trading balance to funding balance — required before a
+// withdrawal, since trades settle into the trading balance.
+app.post("/api/transfer-to-funding", async (req, res) => {
+  try {
+    const { asset, amount } = req.body;
+    if (!asset || !amount) throw new Error("asset and amount required");
+    const result = await xrocketCall("POST", "/api/v1/transfers", {
+      body: { asset: asset.toUpperCase(), amount: String(amount), direction: "trading-to-funding" },
+    });
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// body: { asset, amount, address, network? }
+app.post("/api/withdraw", async (req, res) => {
+  try {
+    const { asset, amount, address, network } = req.body;
+    if (!asset || !amount || !address) throw new Error("asset, amount, address required");
+    const body = { asset: asset.toUpperCase(), amount: String(amount), address };
+    if (network) body.network = network;
+    const result = await xrocketCall("POST", "/api/v1/accounts/funding/withdrawals", { body });
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Simplest sweep: pairs already trade vs USDT, so a closed trade leaves you
+// holding USDT in the trading balance. Move it to funding, then withdraw to
+// your TON wallet over the TON network — xRocket's native chain, so this
+// should need no conversion step at all.
+app.post("/api/sweep-direct", async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const address = process.env.TON_PAYOUT_ADDRESS;
+    if (!address) throw new Error("TON_PAYOUT_ADDRESS not configured in .env");
+    if (!amount) throw new Error("amount required");
+
+    await xrocketCall("POST", "/api/v1/transfers", {
+      body: { asset: "USDT", amount: String(amount), direction: "trading-to-funding" },
+    });
+    const result = await xrocketCall("POST", "/api/v1/accounts/funding/withdrawals", {
+      body: { asset: "USDT", amount: String(amount), address, network: "TON" },
+    });
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Fallback via Changelly, for assets xRocket can't withdraw directly on TON.
+app.post("/api/sweep-execute", async (req, res) => {
+  try {
+    const { from, amountFrom } = req.body;
+    const to = process.env.CHANGELLY_USDT_TON_TICKER || "usdtton";
+    const address = process.env.TON_PAYOUT_ADDRESS;
+    if (!address) throw new Error("TON_PAYOUT_ADDRESS not configured in .env");
+
+    const tx = await changellyCall("createTransaction", { from, to, address, amountFrom: String(amountFrom) });
+    await xrocketCall("POST", "/api/v1/transfers", {
+      body: { asset: from.toUpperCase(), amount: String(amountFrom), direction: "trading-to-funding" },
+    });
+    const withdrawal = await xrocketCall("POST", "/api/v1/accounts/funding/withdrawals", {
+      body: { asset: from.toUpperCase(), amount: String(amountFrom), address: tx.payinAddress },
+    });
+    res.json({ ok: true, changelly: tx, withdrawal });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+const PORT = process.env.PORT || 8787;
+
+app.get(/^(?!\/api\/).*/, (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.listen(PORT, () => {
+  console.log(`Spike-bot server listening on http://localhost:${PORT}`);
+  console.log(`Open that URL in a browser — the dashboard and API now live together.`);
+});
