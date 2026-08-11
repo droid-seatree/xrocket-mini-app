@@ -9,7 +9,7 @@ const CONFIG = {
   adminFeePercent: 0.03, // 3% platform fee for standard users
   xrocketApiKey: process.env.XROCKET_API_KEY,
   withdrawCurrency: 'USDT',
-  requiredAccessKey: process.env.ACCESS_KEY || '11c404e0a9d31914f6003a9af65f301eeb9721deff93e59b02daaf683d6f0f7e',
+  requiredAccessKey: process.env.ACCESS_KEY || '',
   targetPairs: ['BTC_USDT', 'XAUT_USDT', 'ETH_USDT', 'SOL_USDT'],
   stopLossPercent: 0.065, // Fixed 6.5% Stop Loss
   maxTradeUsdtCap: 25.00,
